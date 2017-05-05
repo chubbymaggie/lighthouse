@@ -1,10 +1,12 @@
+import os
+
 from idaapi import plugin_t
 
 from lighthouse.ui import *
 from lighthouse.util import *
 from lighthouse.parsers import *
-from lighthouse.coverage import *
-from lighthouse.painting import *
+from lighthouse.director import CoverageDirector
+from lighthouse.painting import paint_hexrays
 
 # start the global logger *once*
 if not logging_started():
@@ -14,7 +16,7 @@ if not logging_started():
 # IDA Plugin
 #------------------------------------------------------------------------------
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.3.0"
 AUTHORS        = "Markus Gaasedelen"
 DATE           = "2017"
 
@@ -39,18 +41,17 @@ class Lighthouse(plugin_t):
 
         # plugin color palette
         self.palette = LighthousePalette()
-        self.color = 0
 
         #----------------------------------------------------------------------
 
         # the database coverage data conglomerate
-        self.db_coverage = DatabaseCoverage()
+        self.director = CoverageDirector(self.palette)
 
         # hexrays hooks
         self._hxe_events = None
 
         # plugin qt elements
-        self._ui_coverage_list = CoverageOverview(self.db_coverage)
+        self._ui_coverage_overview = CoverageOverview(self.director)
 
         # members for the 'Load Code Coverage' menu entry
         self._icon_id_load     = idaapi.BADADDR
@@ -117,10 +118,10 @@ class Lighthouse(plugin_t):
         """
         self._install_ui()
 
-        # TODO/NOTE: let's delay these till coverage load instead
+        # NOTE: let's delay these till coverage load instead
         #self._install_hexrays_hooks()
 
-    def _install_hexrays_hooks(self, _=None):
+    def _install_hexrays_hooks(self):
         """
         Install Hexrays hook listeners.
         """
@@ -131,7 +132,7 @@ class Lighthouse(plugin_t):
 
         # ensure hexrays is loaded & ready for use
         if not idaapi.init_hexrays_plugin():
-            raise RuntimeError("HexRays is not available yet")
+            raise RuntimeError("HexRays not available for hooking")
 
         #
         # map our callback function to an actual member since we can't properly
@@ -142,7 +143,7 @@ class Lighthouse(plugin_t):
         self._hxe_events = self._hexrays_callback
 
         # install the callback handler
-        idaapi.install_hexrays_callback(self._hxe_events)
+        assert idaapi.install_hexrays_callback(self._hxe_events)
 
     def print_banner(self):
         """
@@ -180,7 +181,6 @@ class Lighthouse(plugin_t):
 
         # createa a custom IDA icon
         self._icon_id_load = idaapi.load_custom_icon(
-            #data=str(QtCore.QResource(":/icons/overview.png").data())
             data=str(open(resource_file("icons/load.png"), "rb").read())
         )
 
@@ -218,7 +218,6 @@ class Lighthouse(plugin_t):
 
         # createa a custom IDA icon
         self._icon_id_overview = idaapi.load_custom_icon(
-            #data=str(QtCore.QResource(":/icons/overview.png").data())
             data=str(open(resource_file("icons/overview.png"), "rb").read())
         )
 
@@ -258,7 +257,19 @@ class Lighthouse(plugin_t):
         Cleanup & uninstall the plugin from IDA.
         """
         self._uninstall_ui()
-        # TODO: uninstall hxe hooks
+        self._uninstall_hexrays_hooks()
+
+    def _uninstall_hexrays_hooks(self):
+        """
+        Cleanup & uninstall Hexrays hook listeners.
+        """
+        if not self._hxe_events:
+            return
+
+        # remove the callbacks
+        #    NOTE: w/e IDA removes this anyway.....
+        #idaapi.remove_hexrays_callback(self._hxe_events)
+        self._hxe_events = None
 
     #--------------------------------------------------------------------------
     # Termination - UI
@@ -331,33 +342,54 @@ class Lighthouse(plugin_t):
         if not coverage_files:
             return
 
-        # load the selected code coverage files into the plugin core
-        for filename in coverage_files:
-            self.load_code_coverage_file(filename)
+        # TODO: this is okay here for now, but should probably be moved later
+        self.palette.refresh_colors()
 
-        # done loading coverage files, bake metrics
-        self.db_coverage.finalize(self.palette)
+        #
+        # TODO:
+        #
+        #   I do not hold great confidence in this code yet, so let's wrap
+        #   this in a try/catch so the user doesn't get stuck with a wait
+        #   box they can't close should things go poorly ;P
+        #
+
+        try:
+
+            #
+            # collect underlying database metadata so that the plugin core can
+            # process, map, and manipulate coverage data in a performant manner.
+            #
+            # TODO: do this asynchronously as the user is selecting files
+            #
+
+            idaapi.show_wait_box("Building database metadata...")
+            self.director.refresh()
+
+            #
+            # load the selected code coverage files into the plugin core
+            #
+
+            idaapi.replace_wait_box("Loading coverage files from disk...")
+            for filename in coverage_files:
+                self.load_code_coverage_file(filename)
+            idaapi.hide_wait_box()
+
+        # 'something happened :('
+        except Exception as e:
+            idaapi.hide_wait_box()
+            lmsg("Failed to load coverage:")
+            lmsg("- %s" % e)
+            logger.exception(e)
+            return
+
+        # select the 'first' coverage file loaded
+        self.director.select_coverage(os.path.basename(coverage_files[0]))
 
         # install hexrays hooks if available for this arch/install
         try:
             self._install_hexrays_hooks()
         except RuntimeError:
             pass
-
-        #
-        # depending on if IDA is using a dark or light theme, we paint
-        # coverage with a color that will hopefully keep things readable.
-        # determine whether to use a 'dark' or 'light' paint
-        #
-
-        bg_color = get_disas_bg_color()
-        if bg_color.lightness() > 255.0/2:
-            self.color = self.palette.paint_light
-        else:
-            self.color = self.palette.paint_dark
-
-        # color the database based on coverage
-        paint_coverage(self.db_coverage, self.color)
 
         # show the coverage overview
         self.open_coverage_overview()
@@ -366,12 +398,7 @@ class Lighthouse(plugin_t):
         """
         Open the Coverage Overview dialog.
         """
-
-        # ensure the database coverage is installed in the coverage overview
-        self._ui_coverage_list.update_model(self.db_coverage)
-
-        # make the coverage overview visible
-        self._ui_coverage_list.Show()
+        self._ui_coverage_overview.Show()
 
     def _select_code_coverage_files(self):
         """
@@ -384,9 +411,12 @@ class Lighthouse(plugin_t):
 
         # prompt the user with the file dialog, and await filename(s)
         filenames, _ = file_dialog.getOpenFileNames()
+
+        # log the captured (selected) filenames from the dialog
         logger.debug("Captured filenames from file dialog:")
         logger.debug(filenames)
 
+        # return the captured filenames
         return filenames
 
     #--------------------------------------------------------------------------
@@ -399,17 +429,21 @@ class Lighthouse(plugin_t):
 
         NOTE: At this time only binary drcov logs are supported.
         """
+        basename = os.path.basename(filename)
 
         # load coverage data from file
         coverage_data = DrcovData(filename)
 
         # extract the coverage relevant to this IDB (well, the root binary)
-        root_filename = idaapi.get_root_filename()
+        root_filename   = idaapi.get_root_filename()
         coverage_blocks = coverage_data.filter_by_module(root_filename)
 
-        # enlighten the databases' coverage hub to this new data
+        # index the coverage for use
         base = idaapi.get_imagebase()
-        self.db_coverage.add_coverage(base, coverage_blocks)
+        indexed_data = index_coverage(base, coverage_blocks)
+
+        # enlighten the coverage director to this new coverage data
+        self.director.add_coverage(basename, base, indexed_data)
 
     def _hexrays_callback(self, event, *args):
         """
@@ -419,19 +453,19 @@ class Lighthouse(plugin_t):
         # decompilation text generation is complete and it is about to be shown
         if event == idaapi.hxe_text_ready:
             vdui = args[0]
+            cfunc = vdui.cfunc
 
-            # grab the coverage data for the function of this decompilation
-            try:
-                function_coverage = self.db_coverage.functions[vdui.cfunc.entry_ea]
-            except KeyError:
+            # if there's no coverage data for this function, there's nothing to do
+            if not cfunc.entry_ea in self.director.coverage.functions:
                 return 0
 
-            # if coverage is zero for this function, there's nothing to paint
-            if not function_coverage.percent_instruction:
-                return 0
-
-            # paint the decompilation for this function
-            paint_hexrays(vdui, function_coverage, self.color)
+            # paint the decompilation text for this function
+            paint_hexrays(
+                cfunc,
+                self.director.metadata,
+                self.director.coverage,
+                self.palette.ida_coverage
+            )
 
         return 0
 
@@ -443,7 +477,7 @@ class LighthousePalette(object):
     """
     Color Palette for the Lighthouse plugin.
 
-    TODO: external customization
+    TODO: external theme customization, controls
     """
 
     def __init__(self):
@@ -451,18 +485,209 @@ class LighthousePalette(object):
         Initialize default palette colors for Lighthouse.
         """
 
-        # blue to red - 'dark' theme
-        self.coverage_bad  = QtGui.QColor(221, 0, 0)
-        self.coverage_good = QtGui.QColor(51, 153, 255)
+        # the active theme name
+        self._qt_theme  = "Light"
+        self._ida_theme = "Light"
 
-        # green to red - 'light' theme
-        #self.coverage_bad  = QtGui.QColor(207, 31, 0)
-        #self.coverage_good = QtGui.QColor(75, 209, 42)
+        # the list of available themes
+        self._themes = \
+        {
+            "Dark":  0,
+            "Light": 1,
+        }
+
+        #
+        # Coverage Overview
+        #
+                              #        dark              -           light
+        self._coverage_bad  = [QtGui.QColor(221, 0, 0),    QtGui.QColor(207, 31, 0)]
+        self._coverage_good = [QtGui.QColor(51, 153, 255), QtGui.QColor(75, 209, 42)]
 
         # TODO: unused for now
-        self.profiling_cold = QtGui.QColor(0,0,0)
-        self.profiling_hot  = QtGui.QColor(0,0,0)
+        #self._profiling_cold = QtGui.QColor(0,0,0)
+        #self._profiling_hot  = QtGui.QColor(0,0,0)
 
-        # color used for painting disassembly/graph/hexrays
-        self.paint_dark  = 0x00990000    # NOTE: IDA uses BBGGRR
-        self.paint_light = 0x00C8E696
+        #
+        # IDA Views / HexRays
+        #
+                             #  dark   -  light
+        self._ida_coverage = [0x990000, 0xC8E696] # NOTE: IDA uses BBGGRR
+
+        #
+        # Composing Shell
+        #
+                               #  dark   -  light
+        self._logic_token    = [0xF02070, 0xFF0000]
+        self._comma_token    = [0x00FF00, 0x0000FF]
+        self._paren_token    = [0x40FF40, 0x0000FF]
+        self._coverage_token = [0x80F0FF, 0x000000]
+        self._invalid_text   = [0x990000, 0xFF0000]
+
+    #--------------------------------------------------------------------------
+    # Theme Management
+    #--------------------------------------------------------------------------
+
+    @property
+    def ida_theme(self):
+        """
+        Return the active IDA theme number.
+        """
+        return self._themes[self._ida_theme]
+
+    @property
+    def qt_theme(self):
+        """
+        Return the active Qt theme number.
+        """
+        return self._themes[self._qt_theme]
+
+    def refresh_colors(self):
+        """
+        Dynamically compute palette color based on IDA theme.
+
+        Depending on if IDA is using a dark or light theme, we *try*
+        to select colors that will hopefully keep things most readable.
+        """
+        self._qt_theme  = self._qt_theme_hint()
+        self._ida_theme = self._ida_theme_hint()
+
+    def _ida_theme_hint(self):
+        """
+        Binary hint of the IDA color theme.
+
+        This routine returns a best effort hint as to what kind of theme is
+        in use for the IDA Views (Disas, Hex, HexRays, etc).
+
+        Returns 'Dark' or 'Light' indicating the user's theme
+        """
+
+        #
+        # determine whether to use a 'dark' or 'light' paint based on the
+        # background color of the user's disassembly view
+        #
+
+        bg_color = get_disas_bg_color()
+
+        # return 'Dark' or 'Light'
+        return test_color_brightness(bg_color)
+
+    def _qt_theme_hint(self):
+        """
+        Binary hint of the Qt color theme.
+
+        This routine returns a best effort hint as to what kind of theme the
+        QtWdigets throughout IDA are using. This is to accomodate for users
+        who may be using Zyantific's IDASkins plugins (or others) to further
+        customize IDA's appearance.
+
+        Returns 'Dark' or 'Light' indicating the user's theme
+        """
+
+        #
+        # to determine what kind of Qt based theme IDA is using, we create a
+        # test widget and check the colors put into the palette the widget
+        # inherits from the application (eg, IDA).
+        #
+
+        test_widget = QtWidgets.QWidget()
+
+        #
+        # in order to 'realize' the palette used to render (draw) the widget,
+        # it first must be made visible. since we don't want to be popping
+        # random widgets infront of the user, so we set this attribute such
+        # that we can silently bake the widget colors.
+        #
+        # NOTE/COMPAT: WA_DontShowOnScreen
+        #
+        #   https://www.riverbankcomputing.com/news/pyqt-56
+        #
+        #   lmao, don't ask me why they forgot about this attribute from 5.0 - 5.6
+        #
+
+        if using_pyqt5():
+            test_widget.setAttribute(103) # taken from http://doc.qt.io/qt-5/qt.html
+        else:
+            test_widget.setAttribute(QtCore.Qt.WA_DontShowOnScreen)
+
+        # render the (invisible) widget
+        test_widget.show()
+
+        # now we farm the background color from the qwidget
+        bg_color = test_widget.palette().color(QtGui.QPalette.Window)
+
+        # 'hide' & delete the widget
+        test_widget.hide()
+        test_widget.deleteLater()
+
+        # return 'Dark' or 'Light'
+        return test_color_brightness(bg_color)
+
+    #--------------------------------------------------------------------------
+    # Coverage Overview
+    #--------------------------------------------------------------------------
+
+    @property
+    def coverage_bad(self):
+        return self._coverage_bad[self.qt_theme]
+
+    @property
+    def coverage_good(self):
+        return self._coverage_good[self.qt_theme]
+
+    #--------------------------------------------------------------------------
+    # IDA Views / HexRays
+    #--------------------------------------------------------------------------
+
+    @property
+    def ida_coverage(self):
+        return self._ida_coverage[self.ida_theme]
+
+    #--------------------------------------------------------------------------
+    # Composing Shell
+    #--------------------------------------------------------------------------
+
+    @property
+    def logic_token(self):
+        return self._logic_token[self.qt_theme]
+
+    @property
+    def comma_token(self):
+        return self._comma_token[self.qt_theme]
+
+    @property
+    def paren_token(self):
+        return self._paren_token[self.qt_theme]
+
+    @property
+    def coverage_token(self):
+        return self._coverage_token[self.qt_theme]
+
+    @property
+    def invalid_text(self):
+        return self._invalid_text[self.qt_theme]
+
+    @property
+    def TOKEN_COLORS(self):
+        """
+        Return the palette of token colors.
+        """
+
+        return \
+        {
+
+            # logic operators
+            "OR":    self.logic_token,
+            "XOR":   self.logic_token,
+            "AND":   self.logic_token,
+            "MINUS": self.logic_token,
+
+            # misc
+            "COMMA":   self.comma_token,
+            "LPAREN":  self.paren_token,
+            "RPAREN":  self.paren_token,
+            #"WS":      self.whitepsace_token,
+            #"UNKNOWN": self.unknown_token,
+
+            # coverage
+            "COVERAGE_TOKEN": self.coverage_token,
+        }
