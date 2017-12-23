@@ -55,8 +55,8 @@ class CoverageComboBox(QtWidgets.QComboBox):
         self.setFont(self._font)
 
         # create the underlying model & table to power the combobox dropwdown
-        self.setModel(CoverageComboBoxModel(self._director))
-        self.setView(CoverageComboBoxView(self.model()))
+        self.setModel(CoverageComboBoxModel(self._director, self))
+        self.setView(CoverageComboBoxView(self.model(), self))
 
         #
         # the combobox will pick a size based on its contents when it is first
@@ -94,8 +94,8 @@ class CoverageComboBox(QtWidgets.QComboBox):
         self.view().clicked.connect(self._ui_clicked_delete)
 
         # register for cues from the director
-        self._director.coverage_switched(self.refresh)
-        self._director.coverage_modified(self.refresh)
+        self._director.coverage_switched(self._internal_refresh)
+        self._director.coverage_modified(self._internal_refresh)
 
     #--------------------------------------------------------------------------
     # Signal Handlers
@@ -149,7 +149,7 @@ class CoverageComboBox(QtWidgets.QComboBox):
         #
 
         # NOTE/COMPAT
-        if using_pyqt5():
+        if using_pyqt5:
             self.view().selectionModel().setCurrentIndex(
                 QtCore.QModelIndex(),
                 QtCore.QItemSelectionModel.ClearAndSelect
@@ -187,10 +187,16 @@ class CoverageComboBox(QtWidgets.QComboBox):
     # Refresh
     #--------------------------------------------------------------------------
 
-    @idafast
     def refresh(self):
         """
-        Refresh the coverage combobox.
+        Public refresh of the coverage combobox.
+        """
+        self._internal_refresh()
+
+    @idafast
+    def _internal_refresh(self):
+        """
+        Internal refresh of the coverage combobox.
         """
 
         # refresh the comobobox internals
@@ -266,7 +272,7 @@ class CoverageComboBoxView(QtWidgets.QTableView):
         # - make the 'X' icon column fixed width
         #
 
-        if using_pyqt5():
+        if using_pyqt5:
             hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
             hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Fixed)
             vh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
@@ -296,7 +302,7 @@ class CoverageComboBoxView(QtWidgets.QTableView):
 
     def refresh(self):
         """
-        Refresh the table layout.
+        Refresh the coverage combobox list order.
         """
         model = self.model() # alias for readability
 
@@ -311,7 +317,7 @@ class CoverageComboBoxView(QtWidgets.QTableView):
             # 'Aggregate', or the 'seperator' indexes
             #
 
-            if model.data(model.index(row, 0), QtCore.Qt.AccessibleDescriptionRole) != ENTRY_USER:
+            if not model.data(model.index(row, 1), QtCore.Qt.DecorationRole):
                 self.setSpan(row, 0, 1, model.columnCount())
 
             # this is a user entry, ensure there is no span present (clear it)
@@ -350,7 +356,7 @@ class CoverageComboBoxModel(QtCore.QAbstractTableModel):
     """
 
     def __init__(self, director, parent=None):
-        super(CoverageComboBoxModel, self).__init__()
+        super(CoverageComboBoxModel, self).__init__(parent)
         self.setObjectName(self.__class__.__name__)
         self._director = director
 
@@ -469,10 +475,27 @@ class CoverageComboBoxModel(QtCore.QAbstractTableModel):
             if index.column() == COLUMN_COVERAGE_STRING and index.row() != self._seperator_index:
                 return self._director.get_coverage_string(self._entries[index.row()])
 
-        # 'X' icon data request
+        # icon display request
         elif role == QtCore.Qt.DecorationRole:
-            if index.column() == COLUMN_DELETE and index.row() > self._seperator_index:
-                return self._delete_icon
+
+            # the icon request is for the 'X' column
+            if index.column() == COLUMN_DELETE:
+
+                #
+                # if the coverage entry is below the seperator, it is a user
+                # loaded coverage and should always be deletable
+                #
+
+                if index.row() > self._seperator_index:
+                    return self._delete_icon
+
+                #
+                # as a special case, we allow the aggregate to have a clear
+                # icon, which will clear all user loaded coverages
+                #
+
+                elif self._entries[index.row()] == "Aggregate":
+                    return self._delete_icon
 
         # entry type request
         elif role == QtCore.Qt.AccessibleDescriptionRole:
@@ -529,14 +552,20 @@ class CoverageComboBoxModel(QtCore.QAbstractTableModel):
 
     def refresh(self):
         """
-        Refresh the model data.
+        Refresh the coverage combobox model data.
         """
+
+        # extract all the names from the director with a shorthand symbol
+        with_shorthand = []
+        for name in self._director.coverage_names:
+            if self._director.get_shorthand(name):
+                with_shorthand.append(name)
 
         # re-populate the model entries
         self._entries  = []
         self._entries += list(self._director.special_names)
         self._entries += [SEPARATOR]
-        self._entries += list(self._director.coverage_names)
+        self._entries += with_shorthand
 
         # save the index of the separator for easy reference
         self._seperator_index = self._entries.index(SEPARATOR)

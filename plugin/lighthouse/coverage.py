@@ -124,6 +124,7 @@ class DatabaseCoverage(object):
 
         self.nodes     = {}
         self.functions = {}
+        self.instruction_percent = 0.0
 
         #
         # we instantiate a single weakref of ourself (the DatbaseMapping
@@ -151,23 +152,6 @@ class DatabaseCoverage(object):
         """
         return self._hitmap.viewkeys()
 
-    @property
-    def instruction_percent(self):
-        """
-        The database coverage % by instructions executed in all defined functions.
-        """
-        num_funcs = len(self._metadata.functions)
-
-        # avoid a zero division error
-        if not num_funcs:
-            return 0
-
-        # sum all the function coverage %'s
-        func_sum = sum(f.instruction_percent for f in self.functions.itervalues())
-
-        # return the average function coverage % aka 'the database coverage %'
-        return func_sum / num_funcs
-
     #--------------------------------------------------------------------------
     # Metadata Population
     #--------------------------------------------------------------------------
@@ -179,10 +163,7 @@ class DatabaseCoverage(object):
 
         # install the new metadata
         self._metadata = weakref.proxy(metadata)
-
-        # unmap all the coverage affected by the metadata delta
-        if delta:
-            self._unmap_delta(delta)
+        self.unmap_all()
 
     def refresh(self):
         """
@@ -194,6 +175,12 @@ class DatabaseCoverage(object):
 
         # bake our coverage map
         self._finalize(dirty_nodes, dirty_functions)
+
+        # update the coverage hash incase the hitmap changed
+        self._update_coverage_hash()
+
+        # dump the unmappable coverage data
+        #self.dump_unmapped()
 
     def refresh_nodes(self):
         """
@@ -208,6 +195,7 @@ class DatabaseCoverage(object):
         """
         self._finalize_nodes(dirty_nodes)
         self._finalize_functions(dirty_functions)
+        self._finalize_instruction_percent()
 
     def _finalize_nodes(self, dirty_nodes):
         """
@@ -223,11 +211,28 @@ class DatabaseCoverage(object):
         for function_coverage in dirty_functions.itervalues():
             function_coverage.finalize()
 
+    def _finalize_instruction_percent(self):
+        """
+        Finalize the database coverage % by instructions executed in all defined functions.
+        """
+
+        # sum all the instructions in the database metadata
+        total = sum(f.instruction_count for f in self._metadata.functions.itervalues())
+        if not total:
+            self.instruction_percent = 0.0
+            return
+
+        # sum all the instructions executed by the coverage
+        executed = sum(f.instructions_executed for f in self.functions.itervalues())
+
+        # return the average function coverage % aka 'the database coverage %'
+        self.instruction_percent = float(executed) / total
+
     #--------------------------------------------------------------------------
     # Data Operations
     #--------------------------------------------------------------------------
 
-    def add_data(self, data):
+    def add_data(self, data, update=True):
         """
         Add runtime data to this mapping.
         """
@@ -236,11 +241,34 @@ class DatabaseCoverage(object):
         for address, hit_count in data.iteritems():
             self._hitmap[address] += hit_count
 
+        # do not update other internal structures if requested
+        if not update:
+            return
+
         # update the coverage hash incase the hitmap changed
         self._update_coverage_hash()
 
         # mark these touched addresses as dirty
         self._unmapped_data |= data.viewkeys()
+
+    def add_addresses(self, addresses, update=True):
+        """
+        Add a list of instruction addresses to this mapping (eg, a trace).
+        """
+
+        # increment the hit count for an address
+        for address in addresses:
+            self._hitmap[address] += 1
+
+        # do not update other internal structures if requested
+        if not update:
+            return
+
+        # update the coverage hash incase the hitmap changed
+        self._update_coverage_hash()
+
+        # mark these touched addresses as dirty
+        self._unmapped_data |= set(addresses)
 
     def subtract_data(self, data):
         """
@@ -271,11 +299,7 @@ class DatabaseCoverage(object):
         # current implementation of things
         #
 
-        self._unmap_all()
-
-    #--------------------------------------------------------------------------
-    # Coverage Operations
-    #--------------------------------------------------------------------------
+        self.unmap_all()
 
     def mask_data(self, coverage_mask):
         """
@@ -344,15 +368,14 @@ class DatabaseCoverage(object):
             address = addresses_to_map.popleft()
 
             # get the node (basic block) that contains this address
-            try:
-                node_metadata = self._metadata.get_node(address)
+            node_metadata = self._metadata.get_node(address)
 
             #
             # failed to locate the node (basic block) for this address.
             # this address must not fall inside of a defined function...
             #
 
-            except ValueError:
+            if not node_metadata:
                 continue
 
             #
@@ -392,9 +415,15 @@ class DatabaseCoverage(object):
 
             while 1:
 
-                # map the hitmap data for the current address to this node mapping
-                node_coverage.executed_instructions[address] = self._hitmap[address]
-                self._unmapped_data.discard(address)
+                #
+                # map the hitmap data for the current address (an instruction)
+                # to this node mapping and mark the instruction as mapped by
+                # discarding its address from the unmapped data list
+                #
+
+                if address in node_metadata.instructions:
+                    node_coverage.executed_instructions[address] = self._hitmap[address]
+                    self._unmapped_data.discard(address)
 
                 # get the next address to attempt mapping on
                 address = addresses_to_map.popleft()
@@ -447,20 +476,16 @@ class DatabaseCoverage(object):
             # coverage mapping
             #
 
-            try:
-                function_coverage = self.functions[function_metadata.address]
+            function_coverage = self.functions.get(function_metadata.address, None)
 
             #
-            # failed to locate a function coverage object, looks like this
-            # is the first time we have identiied coverage for this
-            # function. creaate a coverage function object and use it now.
+            # if we failed to locate a function coverage object, it means
+            # that this is the first time we have identified coverage for this
+            # function. create a new coverage function object and use it now.
             #
 
-            except KeyError as e:
-                function_coverage = FunctionCoverage(
-                    function_metadata.address,
-                    self._weak_self
-                )
+            if not function_coverage:
+                function_coverage = FunctionCoverage(function_metadata.address, self._weak_self)
                 self.functions[function_metadata.address] = function_coverage
 
             # mark this node as executed in the function level mappping
@@ -472,7 +497,7 @@ class DatabaseCoverage(object):
         # done
         return dirty_functions
 
-    def _unmap_all(self):
+    def unmap_all(self):
         """
         Unmap all mapped data.
         """
@@ -528,6 +553,18 @@ class DatabaseCoverage(object):
         """
         for function_address in function_addresses:
             self.functions.pop(function_address, None)
+
+    #--------------------------------------------------------------------------
+    # Debug
+    #--------------------------------------------------------------------------
+
+    def dump_unmapped(self):
+        """
+        Dump the unmapped coverage data.
+        """
+        lmsg("Unmapped Coverage:")
+        for address in self._unmapped_data:
+            lmsg(" * 0x%X" % address)
 
 #------------------------------------------------------------------------------
 # Function Level Coverage

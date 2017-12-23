@@ -1,10 +1,11 @@
 import time
 import Queue
 import logging
+import binascii
 import functools
 
 import idaapi
-from qtshim import using_pyqt5, QtCore, QtGui, QtWidgets
+from .shims import using_ida7api, using_pyqt5, QtCore, QtGui, QtWidgets
 
 logger = logging.getLogger("Lighthouse.Util.IDA")
 
@@ -45,6 +46,7 @@ def map_line2citem(decompilation_text):
     for line_number in xrange(decompilation_text.size()):
         line_text = decompilation_text[line_number].line
         line2citem[line_number] = lex_citem_indexes(line_text)
+        #logger.debug("Line Text: %s" % binascii.hexlify(line_text))
 
     return line2citem
 
@@ -101,11 +103,10 @@ def map_line2node(cfunc, metadata, line2citem):
                 continue
 
             # find the graph node (eg, basic block) that generated this citem
-            try:
-                node = metadata.get_node(address)
+            node = metadata.get_node(address)
 
             # address not mapped to a node... weird. continue to the next citem
-            except ValueError:
+            if not node:
                 #logger.warning("Failed to map node to basic block")
                 continue
 
@@ -184,7 +185,57 @@ def lex_citem_indexes(line):
 # Misc
 #------------------------------------------------------------------------------
 
-def get_disas_bg_color():
+def touch_window(target):
+    """
+    Touch a window/widget/form to ensure it gets drawn by IDA.
+
+    XXX/HACK:
+
+      We need to ensure that widget we will analyze actually gets drawn
+      so that there are colors for us to steal.
+
+      To do this, we switch to it, and switch back. I tried a few different
+      ways to trigger this from Qt, but could only trigger the full
+      painting by going through the IDA routines.
+
+    """
+
+    # get the currently active widget/form title (the form itself seems transient...)
+    if using_ida7api:
+        twidget = idaapi.get_current_widget()
+        title = idaapi.get_widget_title(twidget)
+    else:
+        form = idaapi.get_current_tform()
+        title = idaapi.get_tform_title(form)
+
+    # touch/draw the widget by playing musical chairs
+    if using_ida7api:
+
+        # touch the target window by switching to it
+        idaapi.activate_widget(target, True)
+        flush_ida_sync_requests()
+
+        # locate our previous selection
+        previous_twidget = idaapi.find_widget(title)
+
+        # return us to our previous selection
+        idaapi.activate_widget(previous_twidget, True)
+        flush_ida_sync_requests()
+
+    else:
+
+        # touch the target window by switching to it
+        idaapi.switchto_tform(target, True)
+        flush_ida_sync_requests()
+
+        # locate our previous selection
+        previous_form = idaapi.find_tform(title)
+
+        # lookup our original form and switch back to it
+        idaapi.switchto_tform(previous_form, True)
+        flush_ida_sync_requests()
+
+def get_ida_bg_color():
     """
     Get the background color of an IDA disassembly view.
 
@@ -201,30 +252,123 @@ def get_disas_bg_color():
 
     PS: please expose the get_graph_color(...) palette accessor, Ilfak ;_;
     """
+    if using_ida7api:
+        return get_ida_bg_color_ida7()
+    else:
+        return get_ida_bg_color_ida6()
 
-    # find a form (eg, IDA view) to steal a pixel from
-    for i in xrange(5):
-        form = idaapi.find_tform("IDA View-%c" % chr(ord('A') + i))
+def get_ida_bg_color_ida7():
+    """
+    Get the background color of an IDA disassembly view. (IDA 7+)
+    """
+    names  = ["Enums", "Structures"]
+    names += ["Hex View-%u" % i for i in range(5)]
+    names += ["IDA View-%c" % chr(ord('A') + i) for i in range(5)]
+
+    # find a form (eg, IDA view) to analyze colors from
+    for window_name in names:
+        twidget = idaapi.find_widget(window_name)
+        if twidget:
+            break
+    else:
+        raise RuntimeError("Failed to find donor view")
+
+    # touch the target form so we know it is populated
+    touch_window(twidget)
+
+    # locate the Qt Widget for a form and take 1px image slice of it
+    import sip
+    widget = sip.wrapinstance(long(twidget), QtWidgets.QWidget)
+    pixmap = widget.grab(QtCore.QRect(0, 10, widget.width(), 1))
+
+    # convert the raw pixmap into an image (easier to interface with)
+    image = QtGui.QImage(pixmap.toImage())
+
+    # return the predicted background color
+    return QtGui.QColor(predict_bg_color(image))
+
+def get_ida_bg_color_ida6():
+    """
+    Get the background color of an IDA disassembly view. (IDA 6.x)
+    """
+    names  = ["Enums", "Structures"]
+    names += ["Hex View-%u" % i for i in range(5)]
+    names += ["IDA View-%c" % chr(ord('A') + i) for i in range(5)]
+
+    # find a form (eg, IDA view) to analyze colors from
+    for window_name in names:
+        form = idaapi.find_tform(window_name)
         if form:
             break
     else:
-        raise RuntimeError("Failed to find donor IDA View")
+        raise RuntimeError("Failed to find donor View")
 
-    # locate the Qt Widget for an IDA View form and take 2px tall screenshot
-    if using_pyqt5():
+    # touch the target form so we know it is populated
+    touch_window(form)
+
+    # locate the Qt Widget for a form and take 1px image slice of it
+    if using_pyqt5:
         widget = idaapi.PluginForm.FormToPyQtWidget(form)
-        pixmap = widget.grab(QtCore.QRect(0, 0, widget.width(), 2))
+        pixmap = widget.grab(QtCore.QRect(0, 10, widget.width(), 1))
     else:
         widget = idaapi.PluginForm.FormToPySideWidget(form)
-        region = QtCore.QRect(0, 0, widget.width(), 2)
+        region = QtCore.QRect(0, 10, widget.width(), 1)
         pixmap = QtGui.QPixmap.grabWidget(widget, region)
 
-    # extract 1 pixel like a pleb (hopefully a background pixel :|)
-    img    = QtGui.QImage(pixmap.toImage())
-    color  = QtGui.QColor(img.pixel(img.width()/2,1))
+    # convert the raw pixmap into an image (easier to interface with)
+    image = QtGui.QImage(pixmap.toImage())
 
-    # return the color of the pixel we extracted
-    return color
+    # return the predicted background color
+    return QtGui.QColor(predict_bg_color(image))
+
+def predict_bg_color(image):
+    """
+    Predict the background color of an IDA View from a given image slice.
+
+    We hypothesize that the 'background color' of a given image slice of an
+    IDA form will be the color that appears in the longest 'streaks' or
+    continuous sequences. This will probably be true 99% of the time.
+
+    This function takes an image, and analyzes its first row of pixels. It
+    will return the color that it believes to be the 'background color' based
+    on its sequence length.
+    """
+    assert image.width() and image.height()
+
+    # the details for the longest known color streak will be saved in these
+    longest = 1
+    speculative_bg = image.pixel(0, 0)
+
+    # this will be the computed length of the current color streak
+    sequence = 1
+
+    # find the longest streak of color in a single pixel slice
+    for x in xrange(1, image.width()):
+
+        # the color of this pixel matches the last pixel, extend the streak count
+        if image.pixel(x, 0) == image.pixel(x-1,0):
+            sequence += 1
+
+            #
+            # this catches the case where the longest color streak is in fact
+            # the last one. this ensures the streak color will get saved.
+            #
+
+            if x != image.width():
+                continue
+
+        # color change, determine if this was the longest continuous color streak
+        if sequence > longest:
+
+            # save the last pixel as the longest seqeuence / most likely BG color
+            longest = sequence
+            speculative_bg = image.pixel(x-1, 0)
+
+            # reset the sequence counter
+            sequence = 1
+
+    # return the color we speculate to be the background color
+    return speculative_bg
 
 #------------------------------------------------------------------------------
 # IDA execute_sync decorators
@@ -246,14 +390,14 @@ def idafast(f):
             return idaapi.execute_sync(ff, idaapi.MFF_FAST)
     return wrapper
 
-def idanowait(f):
+def idawrite_async(f):
     """
     Decorator for marking a function as completely async.
     """
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        return idaapi.execute_sync(ff, idaapi.MFF_NOWAIT)
+        return idaapi.execute_sync(ff, idaapi.MFF_NOWAIT | idaapi.MFF_WRITE)
     return wrapper
 
 def idawrite(f):
@@ -263,7 +407,10 @@ def idawrite(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        return idaapi.execute_sync(ff, idaapi.MFF_WRITE)
+        if idaapi.is_main_thread():
+            return ff()
+        else:
+            return idaapi.execute_sync(ff, idaapi.MFF_WRITE)
     return wrapper
 
 def idaread(f):
@@ -275,7 +422,10 @@ def idaread(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         ff = functools.partial(f, *args, **kwargs)
-        return idaapi.execute_sync(ff, idaapi.MFF_READ)
+        if idaapi.is_main_thread():
+            return ff()
+        else:
+            return idaapi.execute_sync(ff, idaapi.MFF_READ)
     return wrapper
 
 def mainthread(f):
@@ -308,8 +458,13 @@ def execute_sync(sync_flags=idaapi.MFF_FAST):
                 output[0] = function(*args, **kwargs)
                 return 1
 
+            # already in the target (main) thread, execute thunk now
+            if idaapi.is_main_thread():
+                thunk()
+
             # send the synchronization request to IDA
-            idaapi.execute_sync(thunk, sync_flags)
+            else:
+                idaapi.execute_sync(thunk, sync_flags)
 
             # return the output of the synchronized function
             return output[0]
@@ -320,23 +475,19 @@ def execute_sync(sync_flags=idaapi.MFF_FAST):
 # IDA Async Magic
 #------------------------------------------------------------------------------
 
-@mainthread
-def await_future(future, block=True, timeout=1.0):
+def await_future(future):
     """
     This is effectively a technique I use to get around completely blocking
     IDA's mainthread while waiting for a threaded result that may need to make
-    use of the sync operators.
+    use of the execute_sync operators.
 
     Waiting for a 'future' thread result to come through via this function
     lets other execute_sync actions to slip through (at least Read, Fast).
     """
-
-    elapsed  = 0       # total time elapsed processing this future object
     interval = 0.02    # the interval which we wait for a response
-    end_time = time.time() + timeout
 
-    # run until the the future completes or the timeout elapses
-    while block or (time.time() < end_time):
+    # run until the the future arrives
+    while True:
 
         # block for a brief period to see if the future completes
         try:
@@ -348,22 +499,214 @@ def await_future(future, block=True, timeout=1.0):
         #
 
         except Queue.Empty as e:
-            logger.debug("Flushing execute_sync requests")
+            pass
+
+        logger.debug("Awaiting future...")
+
+        #
+        # if we are executing (well, blocking) as the main thread, we need
+        # to flush the event loop so IDA does not hang
+        #
+
+        if idaapi.is_main_thread():
             flush_ida_sync_requests()
+
+def await_lock(lock):
+    """
+    Attempt to acquire a lock without blocking the IDA mainthread.
+
+    See await_future() for more details.
+    """
+
+    elapsed  = 0       # total time elapsed waiting for the lock
+    interval = 0.02    # the interval (in seconds) between acquire attempts
+    timeout  = 60.0    # the total time allotted to acquiring the lock
+    end_time = time.time() + timeout
+
+    # wait until the the lock is available
+    while time.time() < end_time:
+
+        #
+        # attempt to acquire the given lock without blocking (via 'False').
+        # if we succesfully aquire the lock, then we can return (success)
+        #
+
+        if lock.acquire(False):
+            logger.debug("Acquired lock!")
+            return
+
+        #
+        # the lock is not available yet. we need to sleep so we don't choke
+        # the cpu, and try to acquire the lock again next time through...
+        #
+
+        logger.debug("Awaiting lock...")
+        time.sleep(interval)
+
+        #
+        # if we are executing (well, blocking) as the main thread, we need
+        # to flush the event loop so IDA does not hang
+        #
+
+        if idaapi.is_main_thread():
+            flush_ida_sync_requests()
+
+    #
+    # we spent 60 seconds trying to acquire the lock, but never got it...
+    # to avoid hanging IDA indefinitely (or worse), we abort via signal
+    #
+
+    raise RuntimeError("Failed to acquire lock after %f seconds!" % timeout)
 
 @mainthread
 def flush_ida_sync_requests():
     """
     Flush all execute_sync requests.
-
-    NOTE: This MUST be called from the IDA Mainthread to be effective.
     """
-    if not idaapi.is_main_thread():
-        return False
 
     # this will trigger/flush the IDA UI loop
     qta = QtCore.QCoreApplication.instance()
     qta.processEvents()
 
-    # done
-    return True
+#------------------------------------------------------------------------------
+# IDA Util
+#------------------------------------------------------------------------------
+
+# taken from https://github.com/gaasedelen/prefix
+PREFIX_DEFAULT = "MyPrefix"
+PREFIX_SEPARATOR = '%'
+
+def prefix_function(function_address, prefix):
+    """
+    Prefix a function name with the given string.
+    """
+    original_name = get_function_name(function_address)
+    new_name = str(prefix) + PREFIX_SEPARATOR + str(original_name)
+
+    # rename the function with the newly prefixed name
+    idaapi.set_name(function_address, new_name, idaapi.SN_NOWARN)
+
+def prefix_functions(function_addresses, prefix):
+    """
+    Prefix a list of functions with the given string.
+    """
+    for function_address in function_addresses:
+        prefix_function(function_address, prefix)
+
+def clear_prefix(function_address):
+    """
+    Clear the prefix from a given function.
+    """
+    original_name = get_function_name(function_address)
+
+    #
+    # locate the last (rfind) prefix separator in the function name as
+    # we will want to keep everything that comes after it
+    #
+
+    i = original_name.rfind(PREFIX_SEPARATOR)
+
+    # if there is no prefix (separator), there is nothing to trim
+    if i == -1:
+        return
+
+    # trim the prefix off the original function name and discard it
+    new_name = original_name[i+1:]
+
+    # rename the function with the prefix stripped
+    idaapi.set_name(function_address, new_name, idaapi.SN_NOWARN)
+
+def clear_prefixes(function_addresses):
+    """
+    Clear the prefix from a list of given functions.
+    """
+    for function_address in function_addresses:
+        clear_prefix(function_address)
+
+def get_function_name(function_address):
+    """
+    Get a function's true name.
+    """
+
+    # get the original function name from the database
+    if using_ida7api:
+        original_name = idaapi.get_name(function_address)
+    else:
+        original_name = idaapi.get_true_name(idaapi.BADADDR, function_address)
+
+    # sanity check
+    if original_name == None:
+        raise ValueError("Invalid function address")
+
+    # return the function name
+    return original_name
+
+#------------------------------------------------------------------------------
+# Interactive
+#------------------------------------------------------------------------------
+
+@mainthread
+def prompt_string(label, title, default=""):
+    """
+    Prompt the user with a dialog to enter a string.
+
+    This does not block the IDA main thread (unlike idaapi.askstr)
+    """
+    dlg = QtWidgets.QInputDialog(None)
+    dlg.setWindowFlags(dlg.windowFlags() & ~QtCore.Qt.WindowContextHelpButtonHint)
+    dlg.setInputMode(QtWidgets.QInputDialog.TextInput)
+    dlg.setLabelText(label)
+    dlg.setWindowTitle(title)
+    dlg.setTextValue(default)
+    dlg.resize(
+        dlg.fontMetrics().averageCharWidth()*80,
+        dlg.fontMetrics().averageCharWidth()*10
+    )
+    ok = dlg.exec_()
+    text = str(dlg.textValue())
+    return (ok, text)
+
+@mainthread
+def gui_rename_function(function_address):
+    """
+    Interactive rename of a function in the IDB.
+    """
+    original_name = get_function_name(function_address)
+
+    # prompt the user for a new function name
+    ok, new_name = prompt_string(
+        "Please enter function name",
+        "Rename Function",
+        original_name
+       )
+
+    #
+    # if the user clicked cancel, or the name they entered
+    # is identical to the original, there's nothing to do
+    #
+
+    if not (ok or new_name != original_name):
+        return
+
+    # rename the function
+    idaapi.set_name(function_address, new_name, idaapi.SN_NOCHECK)
+
+@mainthread
+def gui_prefix_functions(function_addresses):
+    """
+    Interactive prefixing of functions in the IDB.
+    """
+
+    # prompt the user for a new function name
+    ok, prefix = prompt_string(
+        "Please enter a function prefix",
+        "Prefix Function(s)",
+        PREFIX_DEFAULT
+       )
+
+    # bail if the user clicked cancel or failed to enter a prefix
+    if not (ok and prefix):
+        return
+
+    # prefix the given functions with the user specified prefix
+    prefix_functions(function_addresses, prefix)

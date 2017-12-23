@@ -16,6 +16,9 @@ class LighthousePalette(object):
         Initialize default palette colors for Lighthouse.
         """
 
+        # one-time initialization flag, used for selecting initial palette
+        self._initialized = False
+
         # the active theme name
         self._qt_theme  = "Light"
         self._ida_theme = "Light"
@@ -31,6 +34,7 @@ class LighthousePalette(object):
         # Coverage Overview
         #
 
+        self._selection     = [QtGui.QColor(100, 0, 130),  QtGui.QColor(226, 143, 0)]
         self._coverage_bad  = [QtGui.QColor(221, 0, 0),    QtGui.QColor(207, 31, 0)]
         self._coverage_good = [QtGui.QColor(51, 153, 255), QtGui.QColor(75, 209, 42)]
 
@@ -38,17 +42,27 @@ class LighthousePalette(object):
         # IDA Views / HexRays
         #
 
-        self._ida_coverage = [0x990000, 0xC8E696] # NOTE: IDA uses BBGGRR
+        self._ida_coverage = [0x990000, 0xFFE2A8] # NOTE: IDA uses BBGGRR
 
         #
         # Composing Shell
+        #
+
+        self._overview_bg = [QtGui.QColor(20, 20, 20),    QtGui.QColor(20, 20, 20)]
+        self._composer_fg = [QtGui.QColor(255, 255, 255), QtGui.QColor(255, 255, 255)]
+
+        self._valid_text        = [0x80F0FF, 0x0000FF]
+        self._invalid_text      = [0xF02070, 0xFF0000]
+        self._invalid_highlight = [0x990000, 0xFF0000]
+
+        #
+        # Composition Grammar
         #
 
         self._logic_token    = [0xF02070, 0xFF0000]
         self._comma_token    = [0x00FF00, 0x0000FF]
         self._paren_token    = [0x40FF40, 0x0000FF]
         self._coverage_token = [0x80F0FF, 0x000000]
-        self._invalid_text   = [0x990000, 0xFF0000]
 
     #--------------------------------------------------------------------------
     # Theme Management
@@ -76,6 +90,10 @@ class LighthousePalette(object):
         to select colors that will hopefully keep things most readable.
         """
 
+        # TODO: temporary until I have a better mechanism to do one-time init
+        if self._initialized:
+            return
+
         #
         # NOTE/TODO:
         #
@@ -86,6 +104,9 @@ class LighthousePalette(object):
 
         self._qt_theme  = "Dark" # self._qt_theme_hint()
         self._ida_theme = self._ida_theme_hint()
+
+        # mark the palette as initialized
+        self._initialized = True
 
     def _ida_theme_hint(self):
         """
@@ -99,10 +120,10 @@ class LighthousePalette(object):
 
         #
         # determine whether to use a 'dark' or 'light' paint based on the
-        # background color of the user's disassembly view
+        # background color of the user's IDA text based windows
         #
 
-        bg_color = get_disas_bg_color()
+        bg_color = get_ida_bg_color()
 
         # return 'Dark' or 'Light'
         return test_color_brightness(bg_color)
@@ -140,7 +161,7 @@ class LighthousePalette(object):
         #   lmao, don't ask me why they forgot about this attribute from 5.0 - 5.6
         #
 
-        if using_pyqt5():
+        if using_pyqt5:
             test_widget.setAttribute(103) # taken from http://doc.qt.io/qt-5/qt.html
         else:
             test_widget.setAttribute(QtCore.Qt.WA_DontShowOnScreen)
@@ -163,6 +184,10 @@ class LighthousePalette(object):
     #--------------------------------------------------------------------------
 
     @property
+    def selection(self):
+        return self._selection[self.qt_theme]
+
+    @property
     def coverage_bad(self):
         return self._coverage_bad[self.qt_theme]
 
@@ -183,6 +208,30 @@ class LighthousePalette(object):
     #--------------------------------------------------------------------------
 
     @property
+    def overview_bg(self):
+        return self._overview_bg[self.qt_theme]
+
+    @property
+    def composer_fg(self):
+        return self._composer_fg[self.qt_theme]
+
+    @property
+    def valid_text(self):
+        return self._valid_text[self.qt_theme]
+
+    @property
+    def invalid_text(self):
+        return self._invalid_text[self.qt_theme]
+
+    @property
+    def invalid_highlight(self):
+        return self._invalid_highlight[self.qt_theme]
+
+    #--------------------------------------------------------------------------
+    # Composition Grammar
+    #--------------------------------------------------------------------------
+
+    @property
     def logic_token(self):
         return self._logic_token[self.qt_theme]
 
@@ -197,10 +246,6 @@ class LighthousePalette(object):
     @property
     def coverage_token(self):
         return self._coverage_token[self.qt_theme]
-
-    @property
-    def invalid_text(self):
-        return self._invalid_text[self.qt_theme]
 
     @property
     def TOKEN_COLORS(self):
